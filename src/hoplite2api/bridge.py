@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 import uuid
+import hashlib
 from dataclasses import dataclass, field
 
 from .acp import ACPClient, UpstreamError
@@ -11,6 +12,10 @@ from .protocol import assistant_message, history_key, prompt_text, registered_to
 
 
 class Conflict(Exception):
+    pass
+
+
+class Capacity(Exception):
     pass
 
 
@@ -25,19 +30,28 @@ class Session:
     timer: asyncio.Task | None = None
     had_tool: bool = False
     closed: bool = False
+    tenant: str = "local"
+    deadline: float = 0
 
 
 class Bridge:
-    def __init__(self, key, project, base_url="https://api.hoplite.sh", client_factory=ACPClient.open, idle_timeout=300):
+    def __init__(self, key, project, base_url="https://api.hoplite.sh", client_factory=ACPClient.open, idle_timeout=300,
+                 *, max_sessions=16, max_tenant_sessions=2, turn_timeout=600):
         self.key, self.project, self.base_url = key, project, base_url
         self.client_factory, self.idle_timeout = client_factory, idle_timeout
         self.sessions = set()
         self.pending = {}
         self.idle = {}
         self.active_keys = set()
+        self.opening = {}
+        self.max_sessions, self.max_tenant_sessions, self.turn_timeout = max_sessions, max_tenant_sessions, turn_timeout
+
+    def tenant_for(self, request):
+        return request.get("_tenant", "local")
 
     def key_for(self, request, messages):
-        return history_key(request["model"], messages, request["tools"], request["reasoning_effort"])
+        key = history_key(request["model"], messages, request["tools"], request["reasoning_effort"])
+        return hashlib.sha256((self.tenant_for(request) + "\0" + key).encode()).hexdigest()
 
     async def close_session(self, session):
         if session.closed:
@@ -72,14 +86,15 @@ class Bridge:
         messages = request["messages"]
         if messages[-1]["role"] == "tool":
             call_id = messages[-1]["tool_call_id"]
-            session = self.pending.get(call_id)
+            tenant = self.tenant_for(request)
+            session = self.pending.get((tenant, call_id))
             if not session or session.closed or session.busy:
                 raise Conflict("Unknown, expired, or already claimed tool call")
             if self.key_for(request, messages[:-1]) != self.key_for(session.request, session.history):
                 raise Conflict("Tool result does not match the pending conversation")
             if registered_tools(request) != registered_tools(session.request):
                 raise Conflict("Registered tools changed during the pending call")
-            for field in ("tool_choice", "parallel_tool_calls", "max_tokens", "max_completion_tokens"):
+            for field in ("tool_choice", "parallel_tool_calls", "max_tokens", "max_completion_tokens", "response_format"):
                 if request.get(field) != session.request.get(field):
                     raise Conflict("Prompt controls changed during the pending call")
             event = session.pending
@@ -87,16 +102,20 @@ class Bridge:
                 await self.close_session(session)
                 raise Conflict("Tool call expired")
             result = text_content(messages[-1].get("content"))
-            payload = {"content": [{"type": "text", "text": result}], "isError": False}
+            is_error = messages[-1].get("is_error", False)
+            payload = {"content": [{"type": "text", "text": result}], "isError": is_error}
             if len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) > session.client.max_result_bytes:
                 raise Conflict("Tool result exceeds upstream limit")
             session.busy = True
-            self.pending.pop(call_id, None)
+            self.pending.pop((tenant, call_id), None)
             if session.timer:
                 session.timer.cancel()
                 session.timer = None
             try:
-                await session.client.reply_tool(event["rpc_id"], result)
+                if is_error:
+                    await session.client.reply_tool(event["rpc_id"], result, is_error=True)
+                else:
+                    await session.client.reply_tool(event["rpc_id"], result)
             except BaseException:
                 await self.close_session(session)
                 raise
@@ -128,6 +147,7 @@ class Bridge:
                 session.timer.cancel()
                 session.timer = None
             session.had_tool = False
+            session.deadline = asyncio.get_running_loop().time() + self.turn_timeout
             session.request, session.history = request, list(messages)
             try:
                 await session.client.start_prompt(prompt_text(request, messages[index:]))
@@ -139,12 +159,32 @@ class Bridge:
         key = self.key_for(request, messages)
         if key in self.active_keys:
             raise Conflict("Conversation already has an active request")
+        tenant = self.tenant_for(request)
+        # Finished warm sessions must not make sequential new chats look busy.
+        # Evict only completed idle sessions, never active/pending tool work.
+        while True:
+            count = sum(s.tenant == tenant for s in self.sessions) + self.opening.get(tenant, 0)
+            tenant_full = count >= self.max_tenant_sessions
+            global_full = len(self.sessions) + sum(self.opening.values()) >= self.max_sessions
+            if not tenant_full and not global_full:
+                break
+            idle = next((s for s in self.idle.values() if not s.busy and not s.pending and (not tenant_full or s.tenant == tenant)), None)
+            if idle is None:
+                raise Capacity("Experimental bridge session capacity reached; retry after completing an existing turn")
+            await self.close_session(idle)
         self.active_keys.add(key)
+        self.opening[tenant] = self.opening.get(tenant, 0) + 1
+        opening = True
         session = None
         try:
             client = await self.client_factory(self.base_url, self.key, self.project)
-            session = Session(client, request, list(messages), active_key=key)
+            session = Session(client, request, list(messages), active_key=key, tenant=tenant,
+                              deadline=asyncio.get_running_loop().time() + self.turn_timeout)
             self.sessions.add(session)
+            self.opening[tenant] -= 1
+            if not self.opening[tenant]:
+                del self.opening[tenant]
+            opening = False
             await client.set_model(request["model"], request["reasoning_effort"])
             await client.register_tools(registered_tools(request))
             await client.start_prompt(prompt_text(request))
@@ -155,13 +195,18 @@ class Bridge:
             else:
                 await self.close_session(session)
             raise
+        finally:
+            if opening:
+                self.opening[tenant] -= 1
+                if not self.opening[tenant]:
+                    del self.opening[tenant]
 
     def publish_tool(self, session, event, text):
         event = dict(event)
         timeout = session.client.tool_timeout
         event["deadline"] -= max(0, timeout - 60)
         call_id = event["call_id"]
-        if not call_id or call_id in self.pending or asyncio.get_running_loop().time() >= event["deadline"]:
+        if not call_id or (session.tenant, call_id) in self.pending or asyncio.get_running_loop().time() >= event["deadline"]:
             raise UpstreamError("Invalid, duplicate, or expired upstream tool call")
         call = {"id": call_id, "type": "function", "function": {"name": event["name"], "arguments": json.dumps(event["arguments"], ensure_ascii=False, separators=(",", ":"), allow_nan=False)}}
         session.history.append(assistant_message(text, call))
@@ -171,7 +216,7 @@ class Bridge:
 
     def commit_tool(self, session):
         session.busy = False
-        self.pending[session.pending["call_id"]] = session
+        self.pending[(session.tenant, session.pending["call_id"])] = session
         self.schedule_expiry(session, session.pending["deadline"] - asyncio.get_running_loop().time())
 
     def commit_done(self, session, text):
@@ -189,7 +234,13 @@ class Bridge:
 
     async def events(self, session):
         while True:
-            event = await session.client.events.get()
+            remaining = session.deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise UpstreamError("Experimental agent turn deadline exceeded; no automatic replay", "turn_timeout")
+            try:
+                event = await asyncio.wait_for(session.client.events.get(), remaining)
+            except TimeoutError:
+                raise UpstreamError("Experimental agent turn deadline exceeded; no automatic replay", "turn_timeout") from None
             kind = event.get("type")
             if kind == "text":
                 yield event

@@ -1,78 +1,76 @@
-![hoplite2api — Hoplite models, local OMP tools](assets/thumbnail.svg)
+# Palatial evaluation fork of hoplite2api
 
-[![Tests](https://github.com/Jwjfr2/hoplite2api/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Jwjfr2/hoplite2api/actions/workflows/tests.yml)
-![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
-[![Hoplite ACP](https://img.shields.io/badge/transport-Hoplite%20ACP-555555)](https://hoplite.sh/docs/cli/acp)
+This fork is an experimental Hoplite cloud-agent bridge for local coding clients. It retains Hoplite's harness. Local tools run in the requesting client, with that client's permissions. It is not a raw model inference endpoint.
 
-Use Hoplite models in OMP. The proxy translates Chat Completions requests into ACP sessions and sends native tool calls back to OMP for local execution.
+Upstream: https://github.com/Jwjfr2/hoplite2api at `abe0f03a34616b5522362eb1351d5282d17a85cd`.
 
-Hoplite's cloud harness stays in the loop. This is not a raw inference endpoint.
+## Current qualification
 
-## Run
+Live synthetic local-agent workflows passed on `gpt-6.1-sol` and `claude-opus-5-5`: unpredictable file retrieval, actual Python file edits, unittest creation, test execution, and independent test verification. OpenCode also executed its local read tool and returned the file marker through the streamed Chat Completions interface.
 
-Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), a Hoplite member API key, and a repository-backed Hoplite project.
+These are bounded functional checks, not a guarantee for every model or workload. Existing Palatial production routes were not replaced. Paid customer publication remains gated on the billing and limit qualifications below.
+
+## Changes in this fork
+
+- A separate bridge credential; clients no longer need the upstream account key.
+- Optional authenticated-gateway tenant namespaces for active, idle and pending tool state.
+- Session/concurrency limits, per-tenant request pacing, body/output bounds, turn deadlines and SSE comment heartbeats.
+- Explicit callback expiry, tool-error propagation and model-selection confirmation.
+- Reported thread-usage snapshots with a REST fallback when ACP returns a stale pre-run snapshot. Context occupancy is never relabelled as input tokens.
+- Durable, content-free idempotency tombstones when an `Idempotency-Key` is supplied. Repeated claims return 409 rather than rerun a local edit.
+- Adapter-validated `response_format: {"type":"json_object"}`. Streaming JSON is buffered until it is valid; this is not native constrained decoding. Invalid output fails without an automatic paid retry.
+- Exact model allowlisting; the CLI defaults to the two agentically tested model IDs.
+
+## Run locally
+
+Requires Python 3.12+, uv, a Hoplite member key and a repository-backed Hoplite project.
 
 ```sh
-git clone https://github.com/Jwjfr2/hoplite2api.git
-cd hoplite2api
 uv sync --locked
-uv run hoplite2api --project YOUR_PROJECT_ID
+# Set HOPLITE_API_KEY privately in the process environment.
+# Set HOPLITE_BRIDGE_KEY to a different random secret (at least 32 characters).
+uv run hoplite2api --project YOUR_PROJECT_ID --port 8091
 ```
 
-Set `HOPLITE_API_KEY` in your environment, or store the key in OMP under `hoplite`; the proxy falls back to `omp token hoplite`. Keep credentials out of command arguments and repository files.
+The listener stays on `127.0.0.1`. Authenticate `/v1/models`, `/v1/capabilities` and `/v1/chat/completions` with `Authorization: Bearer <HOPLITE_BRIDGE_KEY>`. Never give the Hoplite account key to customers or commit an environment file.
 
-The server listens on `127.0.0.1:8091`. Use `--port` to change it. Requests to `/v1/models` and `/v1/chat/completions` require the same key as a Bearer token. `/health` requires no authentication.
+`HOPLITE_ALLOWED_MODELS` accepts a comma-separated list of exact Hoplite IDs. Enabling a catalog model is not evidence of a successful generation test.
 
-## Connect OMP
+Use OpenAI-compatible Chat Completions in a local client. OpenCode's model ID must be the Hoplite ID, for example `gpt-6.1-sol`; its base URL is `http://127.0.0.1:8091/v1`. Use an isolated client configuration when evaluating. Keep the client's own tool approvals enabled.
 
-Add this provider to `~/.omp/agent/models.yml`:
+## Private gateway mode
 
-```yaml
-providers:
-  hoplite:
-    baseUrl: http://127.0.0.1:8091/v1
-    apiKey: HOPLITE_API_KEY # Omit this line when using OMP's stored credential.
-    api: openai-completions
-    compat:
-      supportsStrictMode: false
-      supportsDeveloperRole: true
-      supportsReasoningEffort: true
-      thinkingFormat: openai
-    discovery:
-      type: openai-models-list
-```
+`--gateway-mode` additionally requires `HOPLITE_DISPATCH_JOURNAL` and a stable gateway-generated `X-Palatial-Tenant` (32–64 lowercase hexadecimal characters). The bridge authenticates the gateway service key before trusting this header. The public Palatial edge must overwrite any caller-supplied tenant value. Never expose this internal credential to customers.
 
-Then start OMP:
+Supply an `Idempotency-Key` for each provider attempt. A tombstone is recorded before session acquisition and blocks reuse even after a restart. It deliberately fails closed when a previous attempt's outcome is unknown. It does not replay cached responses or undo tools that already ran.
 
-```sh
-omp models hoplite
-omp --model hoplite/gpt-6.1-sol
-```
+## Important upstream limits
 
-The model list comes from your Hoplite workspace. Context limits and reasoning levels follow its catalog. Model availability still depends on your account.
+| Feature | Status |
+| --- | --- |
+| Chat Completions text and local function tools | Functionally tested on the two models above |
+| Anthropic Messages / OpenAI Responses | Not implemented in this bridge |
+| Images, audio, binary documents | Rejected by this ACP route |
+| Local file reading/editing and client-side commands | The client owns execution and permissions |
+| Tool callback window | Upstream limit of 60 seconds; 512 KiB result |
+| Tool definitions / ACP message | At most 64 tools / 1 MiB |
+| Output token limit | Soft prompt guidance; not a hard spending cap |
+| Strict JSON schema / sampling controls | Not natively supported |
+| Restart during pending tool call | Explicit conflict; no blind replay |
+| Cloud harness isolation | Prompt guidance only; not an enforceable raw-model sandbox boundary |
 
-## How tools work
+Do not bypass a client's denied command by executing it somewhere else. For local operations taking longer than the callback window, a client needs an explicit asynchronous job/start-and-poll tool design; this bridge cannot extend Hoplite's server deadline.
 
-A native ACP callback becomes an OpenAI `tool_calls` response. OMP executes the tool locally and returns its result. The proxy delivers that result to the original callback over the same open WebSocket.
+## Billing qualification
 
-Conversation history, model, tools, and reasoning must match before a pending call can resume. Invalid or expired continuations return `409`. Completed sessions are reused for five minutes. Restarting the proxy discards pending calls and session state.
+`hoplite_usage` is a cumulative **Hoplite-thread** snapshot, including the harness's internal model calls. It is intentionally not emitted as ordinary OpenAI `usage`. Input can be much larger than the external request. Sandbox cost can arrive after model output ends.
 
-## Limits
+Before admitting paid Palatial traffic, verify checkpoint freshness and categories, avoid charging cumulative counters repeatedly, enforce an upstream spending cap, and reconcile the provider's agent-run scope with Palatial's per-request reservation/settlement model. Do not treat absent or stale counters as zero, use context occupancy as a token receipt, or silently turn thread totals into per-request counts. This evaluation does not change customers' balances or create reservations in Palatial.
 
-- **Hoplite still controls the harness.** System/developer messages are included in the task prompt, not installed as upstream system messages. Instructions against cloud tools are not isolation.
-- **Tool results have a 60-second deadline and a 512 KiB limit.** Local operations are not rolled back if the upstream call expires.
-- **Text only.** Images, audio, sampling controls, structured response formats, strict schemas, and multiple completions are rejected.
-- **ACP requests must fit 1 MiB.** Up to 64 functions can be registered; Hoplite trims schemas and descriptions.
-- **Output budgets are soft guidance.** `max_tokens` and `max_completion_tokens` are not hard caps.
-- **Check Hoplite for usage and billing.** Token counters are not relayed to OMP. The cloud harness can make multiple model calls per response, and sandbox time is billable. Trial and spending limits still apply.
-- **Keep it local.** Do not expose this server through a public tunnel or network listener.
-
-## Test
+## Verification and rollback
 
 ```sh
 uv run python -m unittest discover -s tests -v
 ```
 
-Tests run without Hoplite credentials. Live verification used `gpt-6.1-sol` to request OMP's local `read` tool and return an unpredictable file's exact contents. Other advertised models have not been tested end-to-end.
-
-[Issues](https://github.com/Jwjfr2/hoplite2api/issues) · [Actions](https://github.com/Jwjfr2/hoplite2api/actions) · [ACP documentation](https://hoplite.sh/docs/cli/acp)
+The tests use fake upstreams; live checks must be authorized separately and run in disposable folders. See `PALATIAL_INTEGRATION.md` for the phase prompts, release gates and exact rollback prompt. Disable only the experimental supplier/IDs and stop only its recorded process/container; never reset unrelated repository changes or existing production routes.

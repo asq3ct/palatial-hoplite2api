@@ -30,9 +30,10 @@ class Peer:
                     {"id": "reasoning", "options": [{"value": "none"}]},
                 ]})
             elif method == "session/set_config_option":
+                params = message["params"]
                 await self.respond(message, {"configOptions": [
-                    {"id": "model", "options": [{"value": "test-model"}]},
-                    {"id": "reasoning", "options": [{"value": "none"}]},
+                    {"id": "model", "currentValue": "test-model", "options": [{"value": "test-model"}]},
+                    {"id": "reasoning", "currentValue": "none", "options": [{"value": "none"}]},
                 ]})
             elif method == "_hoplite/client_tools/register":
                 servers = message["params"]["servers"]
@@ -65,6 +66,23 @@ class ACPTests(unittest.IsolatedAsyncioTestCase):
 
     async def event(self):
         return await asyncio.wait_for(self.client.events.get(), 1)
+
+    async def test_unconfirmed_model_selection_is_rejected(self):
+        async def wrong(*args):
+            return {"configOptions": [{"id": "model", "currentValue": "different"}]}
+        self.client._request = wrong
+        with self.assertRaises(UpstreamError) as raised:
+            await self.client.set_model("test-model")
+        self.assertEqual(raised.exception.code, "configuration_mismatch")
+
+    async def test_event_backlog_has_a_fixed_bound_and_explicit_error(self):
+        with self.assertRaises(UpstreamError) as raised:
+            for i in range(257):
+                self.client._emit({"type": "text", "text": "x"})
+        self.assertEqual(raised.exception.code, "event_backlog")
+        event = await self.event()
+        self.assertEqual(event["type"], "error")
+        self.assertLessEqual(self.client.events.qsize(), 256)
 
     async def test_control_request_timeout_cleans_up_and_ignores_late_reply(self):
         with patch("hoplite2api.acp._REQUEST_TIMEOUT", 0.05):

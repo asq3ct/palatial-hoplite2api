@@ -4,9 +4,12 @@ import asyncio
 import json
 import logging
 import re
+import httpx
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from websockets.asyncio.client import connect
+from .usage import UsageSnapshot, UsageError
+from . import __version__
 
 
 _MAX_FRAME = 1024 * 1024
@@ -38,8 +41,13 @@ class ACPClient:
         self.session_id = ""
         self.tool_timeout = 60.0
         self.max_result_bytes = 524288
-        self.events = asyncio.Queue()
+        self.events = asyncio.Queue(maxsize=256)
         self.config_options = []
+        self.reported_usage = None
+        self.usage_error = None
+        self.selected_model = None
+        self.expected_run_count = 0
+        self._rest_base = None
         self._reader = asyncio.create_task(self._read_loop())
 
     @classmethod
@@ -54,8 +62,9 @@ class ACPClient:
         except Exception:
             raise UpstreamError("Unable to connect to ACP upstream") from None
         client = cls(ws, key)
+        client._rest_base = base_url.rstrip("/")
         try:
-            init = await client._request("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "hoplite2api", "version": "1.0"}})
+            init = await client._request("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "palatial-hoplite2api", "version": __version__}})
             if init.get("protocolVersion") != 1:
                 raise UpstreamError("Upstream did not negotiate ACP protocol version 1")
             await client._request("authenticate", {"methodId": "hoplite-api-key"})
@@ -64,6 +73,9 @@ class ACPClient:
             if not isinstance(client.session_id, str) or not client.session_id:
                 raise UpstreamError("Upstream returned an invalid session ID")
             client.config_options = session.get("configOptions", [])
+            usage = session.get("_meta", {}).get("hoplite", {}).get("usage")
+            if usage is not None:
+                client.accept_usage(usage)
             return client
         except BaseException:
             await client.close()
@@ -77,6 +89,7 @@ class ACPClient:
             message = "Upstream request failed"
         if self._key:
             message = message.replace(self._key, "[redacted]")
+        message = re.sub(r"(?:hop_|pa_|sk-|ksk_)[A-Za-z0-9_-]{16,}", "[redacted]", message)
         data = error.get("data")
         code = data.get("code") if isinstance(data, dict) else None
         if not isinstance(code, (str, int)):
@@ -86,6 +99,16 @@ class ACPClient:
         if isinstance(code, str):
             code = code.replace(self._key, "[redacted]")[:128] if self._key else code[:128]
         return UpstreamError(message[:512], code)
+
+    def _emit(self, event):
+        try:
+            self.events.put_nowait(event)
+        except asyncio.QueueFull:
+            while not self.events.empty():
+                self.events.get_nowait()
+            failure = UpstreamError("Client is not consuming agent events; run cancelled", "event_backlog")
+            self.events.put_nowait({"type": "error", "error": failure})
+            raise failure
 
     async def _send(self, message):
         try:
@@ -155,6 +178,58 @@ class ACPClient:
             if not isinstance(options, list):
                 raise UpstreamError("Upstream returned invalid configuration options")
             self.config_options = options
+            selected = next((o for o in options if isinstance(o, dict) and o.get("id") == option_id), {})
+            if selected.get("currentValue") != value:
+                raise UpstreamError(f"Upstream did not confirm requested {option_id}", "configuration_mismatch")
+        self.selected_model = model
+        if self.reported_usage and self.reported_usage.model != model:
+            self.reported_usage = None
+
+    def accept_usage(self, value):
+        try:
+            snapshot = UsageSnapshot.parse(value)
+            if self.selected_model and snapshot.model != self.selected_model:
+                raise UsageError("Reported usage model differs from selected model")
+            # Never combine counters across silent model changes or resets.
+            snapshot.delta(self.reported_usage)
+            self.reported_usage = snapshot
+            self.usage_error = None
+        except UsageError:
+            self.usage_error = "reported_usage_unavailable"
+
+    async def read_usage(self):
+        try:
+            async with asyncio.timeout(3):
+                result = await self._request("_hoplite/thread/usage", {"sessionId": self.session_id})
+                self.accept_usage(result.get("usage", result))
+        except (UpstreamError, TimeoutError):
+            self.usage_error = "reported_usage_unavailable"
+        # ACP can return its pre-run snapshot just after stop. The official REST
+        # usage endpoint exposes persisted thread counters; it is not inference.
+        if not self._usage_current() and getattr(self, "_rest_base", None):
+            try:
+                async with asyncio.timeout(5):
+                    async with httpx.AsyncClient(timeout=2, trust_env=False, follow_redirects=False) as http:
+                        for attempt in range(3):
+                            response = await http.get(self._rest_base + "/api/threads/" + self.session_id + "/usage",
+                                                      headers={"X-Api-Key": self._key})
+                            response.raise_for_status()
+                            value = UsageSnapshot.parse_rest(response.json().get("usage"))
+                            if value.model == self.selected_model and value.run_count >= self.expected_run_count:
+                                value.delta(self.reported_usage)
+                                self.reported_usage, self.usage_error = value, None
+                                break
+                            await asyncio.sleep(0.25 * (attempt + 1))
+            except (httpx.HTTPError, ValueError, UsageError, TimeoutError):
+                self.usage_error = "reported_usage_unavailable"
+        if not self._usage_current():
+            return None
+        return self.reported_usage
+
+    def _usage_current(self):
+        if self.usage_error or not self.reported_usage or self.reported_usage.run_count < self.expected_run_count:
+            return False
+        return self.reported_usage.model == self.selected_model
 
     async def register_tools(self, tools: list[dict]) -> None:
         names = [tool.get("name") if isinstance(tool, dict) else None for tool in tools]
@@ -189,6 +264,7 @@ class ACPClient:
         async with self._close_lock:
             if self._prompt is not None:
                 raise UpstreamError("A prompt is already active")
+            self.expected_run_count = max(self.expected_run_count, self.reported_usage.run_count if self.reported_usage else 0) + 1
             rpc_id, future = await self._begin_request("session/prompt", {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}]})
             self._prompt = asyncio.create_task(self._finish_prompt(rpc_id, future))
 
@@ -197,9 +273,9 @@ class ACPClient:
             result = await future
             if not isinstance(result, dict) or not isinstance(result.get("stopReason"), str):
                 raise UpstreamError("Invalid upstream prompt result")
-            await self.events.put({"type": "done", "stop_reason": result["stopReason"]})
+            self._emit({"type": "done", "stop_reason": result["stopReason"]})
         except UpstreamError as exc:
-            await self.events.put({"type": "error", "error": exc})
+            self._emit({"type": "error", "error": exc})
         finally:
             self._pending.pop(rpc_id, None)
             self._prompt = None
@@ -225,14 +301,14 @@ class ACPClient:
         method = message.get("method")
         params = message.get("params")
         if method == "_hoplite/client_tools/call":
-            if not isinstance(params, dict) or params.get("sessionId") != self.session_id or params.get("server") != "omp" or params.get("tool") not in self._tools or not isinstance(params.get("callId"), str) or not isinstance(params.get("arguments"), dict) or rpc_id in self._tool_calls:
+            if not isinstance(params, dict) or params.get("sessionId") != self.session_id or params.get("server") != "omp" or params.get("tool") not in self._tools or not isinstance(params.get("callId"), str) or not 1 <= len(params["callId"]) <= 128 or not isinstance(params.get("arguments"), dict) or rpc_id in self._tool_calls or len(self._tool_calls) >= 64:
                 await self._server_error(rpc_id, -32602, "Invalid or unregistered local tool call")
                 return
             self._tool_calls[rpc_id] = True
-            await self.events.put({"type": "tool_call", "rpc_id": rpc_id, "call_id": params["callId"], "name": params["tool"], "arguments": params["arguments"], "server": "omp", "deadline": asyncio.get_running_loop().time() + self.tool_timeout})
+            self._emit({"type": "tool_call", "rpc_id": rpc_id, "call_id": params["callId"], "name": params["tool"], "arguments": params["arguments"], "server": "omp", "deadline": asyncio.get_running_loop().time() + self.tool_timeout})
         elif method == "session/request_permission":
             await self._server_error(rpc_id, -32000, "Interactive permission is unavailable")
-            await self.events.put({"type": "error", "error": UpstreamError("Upstream requires interactive permission", "permission_required")})
+            self._emit({"type": "error", "error": UpstreamError("Upstream requires interactive permission", "permission_required")})
         else:
             await self._server_error(rpc_id, -32601, "Method not supported")
 
@@ -257,9 +333,11 @@ class ACPClient:
                         if update.get("sessionUpdate") == "agent_message_chunk":
                             content = update.get("content", {})
                             if isinstance(content, dict) and content.get("type") == "text" and isinstance(content.get("text"), str):
-                                await self.events.put({"type": "text", "text": content["text"]})
+                                self._emit({"type": "text", "text": content["text"]})
                         elif update.get("sessionUpdate") == "config_option_update" and isinstance(update.get("configOptions"), list):
                             self.config_options = update["configOptions"]
+                        elif update.get("sessionUpdate") == "usage_update":
+                            self.accept_usage(update)
                 elif "id" in message:
                     future = self._pending.pop(message["id"], None)
                     if future is not None and not future.done():
@@ -284,7 +362,7 @@ class ACPClient:
                 if not future.done():
                     future.set_exception(failure)
             if not self._closing and self._prompt is None:
-                await self.events.put({"type": "error", "error": failure})
+                self._emit({"type": "error", "error": failure})
 
     async def close(self) -> None:
         async with self._close_lock:

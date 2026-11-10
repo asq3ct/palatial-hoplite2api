@@ -17,6 +17,9 @@ import uvicorn
 
 from .acp import ACPClient, UpstreamError
 from .bridge import Bridge, Conflict, completion_base
+from .bridge import Capacity
+from .admission import Limits, RateLimit
+from .journal import DispatchJournal, ReplayConflict
 from .protocol import RequestError, assistant_message, parse_request
 
 
@@ -74,12 +77,22 @@ def model_rows(data):
     return rows
 
 
-def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open, http_client=None, idle_timeout=300, roster_ttl=60):
+def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open, http_client=None, idle_timeout=300, roster_ttl=60,
+               bridge_key=None, require_tenant=False, limits=None, journal_path=None, allowed_models=None):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", project):
         raise ValueError("project must be a safe plaintext project ID")
     if not key:
         raise ValueError("credential must not be empty")
-    bridge = Bridge(key, project, base_url, client_factory, idle_timeout)
+    limits = limits or Limits()
+    if allowed_models is not None and (not isinstance(allowed_models, list) or not 1 <= len(allowed_models) <= 64 or any(not isinstance(m, str) or not 1 <= len(m) <= 256 for m in allowed_models)):
+        raise ValueError("Supply 1-64 exact allowed model IDs")
+    local_key = key if bridge_key is None else bridge_key
+    if not local_key or (bridge_key is not None and hmac.compare_digest(local_key, key)):
+        raise ValueError("Bridge credential must be nonempty and separate from the upstream key")
+    bridge = Bridge(key, project, base_url, client_factory, idle_timeout,
+                    max_sessions=limits.sessions, max_tenant_sessions=limits.tenant_sessions, turn_timeout=limits.turn_seconds)
+    rate = RateLimit(limits.requests_per_minute)
+    journal = DispatchJournal(journal_path) if journal_path else None
     http = http_client or httpx.AsyncClient(base_url=base_url, timeout=20)
     roster = {"rows": None, "until": 0.0}
     roster_lock = asyncio.Lock()
@@ -89,6 +102,8 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
         yield
         await bridge.close()
         await http.aclose()
+        if journal:
+            journal.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.bridge = bridge
@@ -96,7 +111,7 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
     def authorized(request):
         header = request.headers.get("authorization", "")
         scheme, sep, token = header.partition(" ")
-        return bool(sep and scheme.lower() == "bearer" and hmac.compare_digest(token.encode(), key.encode()))
+        return bool(sep and scheme.lower() == "bearer" and hmac.compare_digest(token.encode(), local_key.encode()))
 
     def error(message, status, code=None):
         return JSONResponse({"error": {"message": message, "type": "invalid_request_error" if status < 500 else "server_error", "code": code}}, status_code=status)
@@ -109,6 +124,8 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
                     response = await http.get("/api/model-providers", headers={"X-Api-Key": key})
                     response.raise_for_status()
                     rows = model_rows(response.json())
+                    if allowed_models is not None:
+                        rows = [row for row in rows if row["id"] in allowed_models]
                 except (httpx.HTTPError, ValueError):
                     raise UpstreamError("Unable to fetch upstream model roster") from None
                 roster.update(rows=rows, until=now + roster_ttl)
@@ -116,7 +133,19 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        return {"status": "ok", "scope": "process_liveness", "generation_verified": False}
+
+    @app.get("/v1/capabilities")
+    async def capabilities(request: Request):
+        if not authorized(request):
+            return error("Invalid API key", 401)
+        return {"experimental": True, "protocols": ["chat_completions"], "modalities": ["text"],
+                "adapter_validated_json_object": True, "structured_stream_buffered_until_validated": True,
+                "local_tools": True, "native_strict_json_schema": False, "hard_output_token_cap": False,
+                "max_body_bytes": limits.body_bytes, "max_tools": 64, "max_tool_result_bytes": 524288,
+                "tool_result_deadline_seconds": 60, "turn_deadline_seconds": limits.turn_seconds,
+                "usage_scope": "hoplite_thread", "paid_customer_qualified": False,
+                "note": "Cloud agent harness; local tools execute only in the client. Thread counters are not per-request token usage."}
 
     @app.get("/v1/models")
     async def list_models(request: Request):
@@ -138,8 +167,21 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
         if not authorized(request):
             return error("Invalid API key", 401)
         try:
-            body = await request.json()
+            tenant = request.headers.get("x-palatial-tenant", "") if require_tenant else "local"
+            if require_tenant and not re.fullmatch(r"[a-f0-9]{32,64}", tenant):
+                return error("Authenticated gateway tenant context is required", 400, "tenant_required")
+            if not rate.admit(tenant):
+                response = error("Experimental bridge request limit reached", 429, "rate_limit_exceeded")
+                response.headers["Retry-After"] = "60"
+                return response
+            raw = bytearray()
+            async for chunk in request.stream():
+                if len(raw) + len(chunk) > limits.body_bytes:
+                    return error("Experimental bridge request body exceeds its limit", 413, "body_too_large")
+                raw.extend(chunk)
+            body = json.loads(raw, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Non-finite JSON is unsupported")))
             parsed = parse_request(body)
+            parsed["_tenant"] = tenant
             if parsed["messages"][-1]["role"] != "tool":
                 if parsed["model"] not in {row["id"] for row in await models()}:
                     return error("Model is not in the authorized upstream roster", 400, "model_not_found")
@@ -149,6 +191,16 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
             return error(str(exc), 502)
 
         session = None
+        attempt_key = request.headers.get("idempotency-key")
+        if attempt_key is not None:
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", attempt_key):
+                return error("Invalid idempotency key", 400, "invalid_idempotency_key")
+            if journal is None:
+                return error("Durable idempotency is not configured on this experimental instance", 503, "journal_required")
+            try:
+                journal.claim(tenant, attempt_key, bytes(raw))
+            except ReplayConflict as exc:
+                return error(str(exc), 409, "attempt_already_claimed")
         acquire_task = asyncio.create_task(bridge.acquire(parsed))
         disconnect_task = asyncio.create_task(disconnected(request))
         try:
@@ -163,6 +215,10 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
             session = await acquire_task
         except Conflict as exc:
             return error(str(exc), 409)
+        except Capacity as exc:
+            response = error(str(exc), 429, "session_capacity")
+            response.headers["Retry-After"] = "5"
+            return response
         except UpstreamError as exc:
             return error(str(exc), 502)
         except RequestError as exc:
@@ -181,14 +237,23 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
 
         async def generate():
             text = ""
+            json_mode = parsed["response_format"]["type"] == "json_object"
+            output_bytes = 0
             committed = False
             try:
                 yield ("role", {"role": "assistant"})
                 async for event in bridge.events(session):
                     if event["type"] == "text":
+                        output_bytes += len(event["text"].encode("utf-8"))
+                        if output_bytes > limits.output_bytes:
+                            raise UpstreamError("Experimental bridge output byte limit reached; run cancelled", "output_too_large")
                         text += event["text"]
-                        yield ("text", event["text"])
+                        if not json_mode:
+                            yield ("text", event["text"])
                     elif event["type"] == "tool_call":
+                        if hasattr(session.client, "read_usage"):
+                            snapshot = await session.client.read_usage()
+                            yield ("reported_usage", snapshot.public() if snapshot else None)
                         call = bridge.publish_tool(session, event, text)
                         yield ("tool", call)
                         bridge.commit_tool(session)
@@ -197,8 +262,26 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
                     else:
                         if event.get("stop_reason") != "end_turn":
                             raise UpstreamError("Upstream prompt ended without completing the response")
+                        if json_mode:
+                            try:
+                                def pairs(items):
+                                    result = {}
+                                    for k, v in items:
+                                        if k in result:
+                                            raise ValueError("Duplicate JSON key")
+                                        result[k] = v
+                                    return result
+                                value = json.loads(text, object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+                                if not isinstance(value, dict):
+                                    raise ValueError("JSON object required")
+                            except (ValueError, RecursionError):
+                                raise UpstreamError("Upstream did not produce a valid JSON object; no automatic regeneration was attempted", "structured_output_invalid") from None
+                            yield ("text", text)
                         if (parsed["tool_choice"] == "required" or isinstance(parsed["tool_choice"], dict)) and not session.had_tool:
                             raise UpstreamError("Upstream finished without making the required local tool call")
+                        if hasattr(session.client, "read_usage"):
+                            snapshot = await session.client.read_usage()
+                            yield ("reported_usage", snapshot.public() if snapshot else None)
                         bridge.commit_done(session, text)
                         yield ("finish", "stop")
                         committed = True
@@ -209,8 +292,23 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
         if parsed["stream"]:
             async def stream():
                 iterator = generate()
+                pending = None
                 try:
-                    async for kind, value in iterator:
+                    while True:
+                        if pending is None:
+                            pending = asyncio.create_task(anext(iterator))
+                        done, _ = await asyncio.wait({pending}, timeout=limits.heartbeat_seconds)
+                        if not done:
+                            yield ": keep-alive\n\n"
+                            continue
+                        try:
+                            kind, value = pending.result()
+                        except StopAsyncIteration:
+                            break
+                        pending = None
+                        if kind == "reported_usage":
+                            yield "data: " + json.dumps({**base, "object": "chat.completion.chunk", "choices": [], "hoplite_usage": value}) + "\n\n"
+                            continue
                         if kind == "role":
                             delta, finish = value, None
                         elif kind == "text":
@@ -226,12 +324,17 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
                 except Exception:
                     yield "data: " + json.dumps({"error": {"message": "Proxy response failed", "type": "server_error"}}) + "\n\n"
                 finally:
+                    if pending and not pending.done():
+                        pending.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await pending
                     await iterator.aclose()
                 yield "data: [DONE]\n\n"
-            return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+            return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "X-Palatial-Experimental": "hoplite"})
 
         async def collect():
             text, call, finish = "", None, None
+            reported_usage = None
             iterator = generate()
             try:
                 async for kind, value in iterator:
@@ -241,7 +344,9 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
                         call = value
                     elif kind == "finish":
                         finish = value
-                return {**base, "choices": [{"index": 0, "message": assistant_message(text, call), "finish_reason": finish}]}
+                    elif kind == "reported_usage":
+                        reported_usage = value
+                return {**base, "choices": [{"index": 0, "message": assistant_message(text, call), "finish_reason": finish}], "hoplite_usage": reported_usage}
             finally:
                 await iterator.aclose()
 
@@ -275,13 +380,21 @@ def main():
     parser = argparse.ArgumentParser(description="Serve Hoplite ACP on loopback")
     parser.add_argument("--project", required=True)
     parser.add_argument("--port", type=int, default=8091)
+    parser.add_argument("--gateway-mode", action="store_true", help="Require authenticated gateway tenant context")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", args.project):
         parser.error("--project must be a safe plaintext project ID")
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
     try:
-        app = create_app(args.project, load_key())
+        bridge_key = os.environ.get("HOPLITE_BRIDGE_KEY")
+        if not bridge_key or len(bridge_key) < 32:
+            raise RuntimeError("Set a separate random HOPLITE_BRIDGE_KEY of at least 32 characters")
+        journal_path = os.environ.get("HOPLITE_DISPATCH_JOURNAL")
+        if args.gateway_mode and not journal_path:
+            raise RuntimeError("Gateway mode requires a durable HOPLITE_DISPATCH_JOURNAL path")
+        allowed_models = os.environ.get("HOPLITE_ALLOWED_MODELS", "gpt-6.1-sol,claude-opus-5-5").split(",")
+        app = create_app(args.project, load_key(), bridge_key=bridge_key, require_tenant=args.gateway_mode, journal_path=journal_path, allowed_models=allowed_models)
     except RuntimeError as exc:
         parser.error(str(exc))
     uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)

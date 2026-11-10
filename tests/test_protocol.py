@@ -4,6 +4,7 @@ import unittest
 from hoplite2api.protocol import (
     RequestError, assistant_message, history_key, parse_request,
     registered_tools, text_content,
+    prompt_text,
 )
 
 
@@ -26,6 +27,12 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(RequestError):
             parse_request(self.body)
 
+    def test_full_tool_documentation_survives_upstream_registration_trimming(self):
+        self.body['tools'][0]['function']['description']='COMPLETE_DOC_'+'details '*2000
+        prompt=prompt_text(parse_request(self.body))
+        self.assertIn(self.body['tools'][0]['function']['description'],prompt)
+        self.assertIn('"properties":{"path":{"type":"string"}}',prompt)
+
     def test_text_content_and_rejected_media(self):
         self.assertEqual(text_content([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]), "ab")
         self.assertEqual(text_content(None), "")
@@ -34,7 +41,7 @@ class ProtocolTests(unittest.TestCase):
                 text_content(content)
 
     def test_unsupported_request_fields_and_controls(self):
-        invalid = [{"temperature": 0}, {"top_p": 1}, {"seed": 0}, {"stop": []}, {"logit_bias": {}}, {"presence_penalty": 0}, {"frequency_penalty": 0}, {"n": True}, {"n": 2}, {"max_tokens": 0}, {"max_completion_tokens": True}, {"modalities": ["audio"]}, {"response_format": {"type": "json_object"}}, {"stream_options": {"include_usage": 1}}, {"stream": 1}, {"store": True}, {"unknown": 1}]
+        invalid = [{"temperature": 0}, {"top_p": 1}, {"seed": 0}, {"stop": []}, {"logit_bias": {}}, {"presence_penalty": 0}, {"frequency_penalty": 0}, {"n": True}, {"n": 2}, {"max_tokens": 0}, {"max_completion_tokens": True}, {"modalities": ["audio"]}, {"response_format": {"type": "json_schema"}}, {"stream_options": {"include_usage": 1}}, {"stream": 1}, {"store": True}, {"unknown": 1}]
         for fields in invalid:
             with self.subTest(fields=fields), self.assertRaises(RequestError):
                 parse_request(self.body | fields)

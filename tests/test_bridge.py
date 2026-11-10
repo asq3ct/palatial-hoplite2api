@@ -21,6 +21,7 @@ class FakeACP:
         self.started = []
         self.replies = []
         self.closed = False
+        self.closed_event = asyncio.Event()
 
     async def set_model(self, model, reasoning):
         pass
@@ -36,6 +37,7 @@ class FakeACP:
 
     async def close(self):
         self.closed = True
+        self.closed_event.set()
 
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
@@ -88,7 +90,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expired_callback_closes_active_run(self):
         session, result = await self.pending(timeout=0.01)
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(session.client.closed_event.wait(), 0.5)
         self.assertTrue(session.client.closed)
         with self.assertRaises(Conflict):
             await self.bridge.acquire(parse_request(result))

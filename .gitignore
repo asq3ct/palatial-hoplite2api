@@ -8,3 +8,9 @@ build/
 .env
 .env.*
 .DS_Store
+*.dpapi
+*.db
+*.db-wal
+*.db-shm
+*.log
+live-results/
