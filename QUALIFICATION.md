@@ -4,7 +4,7 @@ This records bounded tests, not guaranteed success for every request.
 
 ## Offline
 
-44 bridge tests pass. They include the upstream suite and new tests for tenant isolation, forged/expired continuations, tool errors, concurrency and idle eviction, payload/output bounds, cancellation, bounded event backlogs, model selection confirmation, stale usage, exact cumulative accounting, JSON-object validation, SSE heartbeats and durable replay prevention. External network access was blocked during these tests.
+45 bridge tests pass. They include the upstream suite and new tests for tenant isolation, forged/expired continuations, tool errors, concurrency and idle eviction, payload/output bounds, cancellation, bounded event backlogs, model selection confirmation, stale usage, exact cumulative accounting, JSON-object validation, SSE heartbeats and durable replay prevention. External network access was blocked during these tests.
 
 ## Live, disposable local files
 

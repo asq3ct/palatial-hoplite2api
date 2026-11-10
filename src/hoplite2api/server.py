@@ -170,10 +170,6 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
             tenant = request.headers.get("x-palatial-tenant", "") if require_tenant else "local"
             if require_tenant and not re.fullmatch(r"[a-f0-9]{32,64}", tenant):
                 return error("Authenticated gateway tenant context is required", 400, "tenant_required")
-            if not rate.admit(tenant):
-                response = error("Experimental bridge request limit reached", 429, "rate_limit_exceeded")
-                response.headers["Retry-After"] = "60"
-                return response
             raw = bytearray()
             async for chunk in request.stream():
                 if len(raw) + len(chunk) > limits.body_bytes:
@@ -182,6 +178,10 @@ def create_app(project, key, *, base_url=UPSTREAM, client_factory=ACPClient.open
             body = json.loads(raw, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("Non-finite JSON is unsupported")))
             parsed = parse_request(body)
             parsed["_tenant"] = tenant
+            if not bridge.valid_continuation(parsed) and not rate.admit(tenant):
+                response = error("Experimental bridge new-prompt limit reached", 429, "rate_limit_exceeded")
+                response.headers["Retry-After"] = "60"
+                return response
             if parsed["messages"][-1]["role"] != "tool":
                 if parsed["model"] not in {row["id"] for row in await models()}:
                     return error("Model is not in the authorized upstream roster", 400, "model_not_found")

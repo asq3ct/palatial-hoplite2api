@@ -15,6 +15,7 @@ These are bounded functional checks, not a guarantee for every model or workload
 - A separate bridge credential; clients no longer need the upstream account key.
 - Optional authenticated-gateway tenant namespaces for active, idle and pending tool state.
 - Session/concurrency limits, per-tenant request pacing, body/output bounds, turn deadlines and SSE comment heartbeats.
+- Valid pending tool continuations keep their session lease instead of consuming new-prompt RPM slots; otherwise a rate-limit retry could outlast the upstream callback deadline.
 - Explicit callback expiry, tool-error propagation and model-selection confirmation.
 - Reported thread-usage snapshots with a REST fallback when ACP returns a stale pre-run snapshot. Context occupancy is never relabelled as input tokens.
 - Durable, content-free idempotency tombstones when an `Idempotency-Key` is supplied. Repeated claims return 409 rather than rerun a local edit.

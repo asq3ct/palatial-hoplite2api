@@ -215,6 +215,26 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.headers["Retry-After"], "60")
         self.assertEqual((await self.send(app, headers={"X-Palatial-Tenant": "b" * 32})).status_code, 200)
 
+    async def test_pending_tool_result_is_not_blocked_by_new_prompt_rate_limit(self):
+        async def factory(*args):
+            c = FakeACP()
+            async def reply(*args):
+                await c.events.put({"type": "text", "text": "OK"})
+                await c.events.put({"type": "done", "stop_reason": "end_turn"})
+            c.reply_tool = reply
+            await c.events.put({"type": "tool_call", "rpc_id": "rpc", "call_id": "known-call", "name": "read", "arguments": {}, "deadline": asyncio.get_running_loop().time() + 60})
+            return c
+        self.factory = factory
+        app = self.app(limits=Limits(requests_per_minute=1))
+        body = copy.deepcopy(BODY)
+        first = await self.send(app, body)
+        self.assertEqual(first.status_code, 200)
+        message = first.json()["choices"][0]["message"]
+        body["messages"] += [message, {"role": "tool", "tool_call_id": "known-call", "content": "file contents"}]
+        resumed = await self.send(app, body)
+        self.assertEqual(resumed.status_code, 200, resumed.text)
+        self.assertEqual(resumed.json()["choices"][0]["message"]["content"], "OK")
+
     async def test_stream_and_nonstream_have_no_fabricated_token_usage(self):
         app = self.app()
         res = await self.send(app)

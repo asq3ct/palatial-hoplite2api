@@ -53,6 +53,19 @@ class Bridge:
         key = history_key(request["model"], messages, request["tools"], request["reasoning_effort"])
         return hashlib.sha256((self.tenant_for(request) + "\0" + key).encode()).hexdigest()
 
+    def valid_continuation(self, request):
+        """Existing callbacks use their session lease, not a fresh-prompt RPM slot."""
+        messages = request["messages"]
+        if messages[-1]["role"] != "tool":
+            return False
+        session = self.pending.get((self.tenant_for(request), messages[-1]["tool_call_id"]))
+        if not session or session.closed or session.busy:
+            return False
+        return (self.key_for(request, messages[:-1]) == self.key_for(session.request, session.history)
+                and registered_tools(request) == registered_tools(session.request)
+                and all(request.get(field) == session.request.get(field) for field in
+                        ("tool_choice", "parallel_tool_calls", "max_tokens", "max_completion_tokens", "response_format")))
+
     async def close_session(self, session):
         if session.closed:
             return
