@@ -235,6 +235,36 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed.status_code, 200, resumed.text)
         self.assertEqual(resumed.json()["choices"][0]["message"]["content"], "OK")
 
+    async def test_one_hundred_tool_continuations_keep_ids_history_and_capacity(self):
+        async def factory(*args):
+            c = FakeACP()
+            count = 0
+            async def next_event():
+                nonlocal count
+                count += 1
+                if count <= 100:
+                    await c.events.put({"type": "tool_call", "rpc_id": f"rpc-{count}", "call_id": f"call-{count}", "name": "read", "arguments": {}, "deadline": asyncio.get_running_loop().time() + 60})
+                else:
+                    await c.events.put({"type": "text", "text": "COMPLETE"})
+                    await c.events.put({"type": "done", "stop_reason": "end_turn"})
+            async def reply(*args):
+                await next_event()
+            c.reply_tool = reply
+            await next_event()
+            return c
+        self.factory = factory
+        app = self.app(limits=Limits(requests_per_minute=1, tenant_sessions=1))
+        body = copy.deepcopy(BODY)
+        for step in range(100):
+            response = await self.send(app, body)
+            self.assertEqual(response.status_code, 200, response.text)
+            message = response.json()["choices"][0]["message"]
+            self.assertEqual(message["tool_calls"][0]["id"], f"call-{step+1}")
+            body["messages"] += [message, {"role": "tool", "tool_call_id": f"call-{step+1}", "content": f"result-{step+1}"}]
+        response = await self.send(app, body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["choices"][0]["message"]["content"], "COMPLETE")
+
     async def test_stream_and_nonstream_have_no_fabricated_token_usage(self):
         app = self.app()
         res = await self.send(app)
